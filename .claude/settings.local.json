@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__gemini-cli__gemini_session_status",
+      "mcp__gemini-cli__gemini_close",
+      "mcp__gemini-cli__gemini_send",
+      "Bash(tmux new-session:*)",
+      "Bash(tmux capture-pane:*)",
+      "Bash(tmux send-keys:*)",
+      "Bash(tmux kill-session:*)",
+      "Bash(tmux ls:*)"
+    ],
+    "deny": []
+  }
+}
