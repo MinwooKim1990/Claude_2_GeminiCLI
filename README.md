@@ -22,8 +22,37 @@ Version 1.5.0 represents a major architectural change from tmux-based interactiv
 ## Prerequisites
 
 - Node.js v18 or higher
-- Gemini CLI installed and configured
+- Gemini CLI installed and authenticated
 - An MCP-compatible client (like Claude Desktop)
+
+### Installing Gemini CLI
+
+1. Install Gemini CLI from the official repository:
+   ```bash
+   git clone https://github.com/google-gemini/gemini-cli
+   cd gemini-cli
+   # Follow installation instructions
+   ```
+
+2. Authenticate with your Google account:
+   ```bash
+   gemini auth
+   ```
+   
+   This will open a browser for Google authentication. You can use a personal Google account to get a free Gemini Code Assist license with:
+   - Access to Gemini 2.5 Pro (1 million token context window)
+   - 60 model requests per minute
+   - 1,000 requests per day
+
+3. Verify installation:
+   ```bash
+   echo "Hello" | gemini
+   ```
+
+### Related Projects
+
+- **Gemini CLI**: https://github.com/google-gemini/gemini-cli - Official Gemini CLI by Google
+- **Claude Code**: https://github.com/anthropics/claude-code - Anthropic's CLI for Claude
 
 ## Installation
 
@@ -205,6 +234,18 @@ Contributions are welcome! Please:
 5. Submit a pull request
 
 ## Changelog
+
+### Version 1.5.3
+- **Enhanced error handling**: Better error messages and logging
+- **Gemini CLI detection**: Checks if Gemini is installed before execution
+- **Improved process handling**: Better stdin/stdout/stderr error handling
+- **Detailed diagnostics**: More verbose logging for troubleshooting
+
+### Version 1.5.2  
+- **Security fix**: Removed shell command injection vulnerability
+- **Direct stdin input**: Now uses direct process spawn without shell (`sh -c`)
+- **Safer execution**: Messages are passed via stdin instead of command line arguments
+- **No escaping needed**: Eliminates complex string escaping requirements
 
 ### Version 1.5.1
 - **Improved timeout handling**: Dynamic timeout that resets when data is received

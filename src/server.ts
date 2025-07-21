@@ -3,30 +3,68 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { spawn } from "child_process";
+import { spawn, execSync } from "child_process";
 
 // Create MCP server
 const server = new McpServer({
   name: "gemini-cli",
-  version: "1.5.1",
+  version: "1.5.4",
   description: "MCP server for interacting with Gemini CLI (one-shot mode)"
 });
+
+// Check if Gemini CLI is available
+function checkGeminiAvailable(): boolean {
+  try {
+    execSync('which gemini', { stdio: 'ignore' });
+    console.error('[Gemini MCP] Gemini CLI found in PATH');
+    return true;
+  } catch {
+    console.error('[Gemini MCP] Gemini CLI not found in PATH');
+    try {
+      // Try to run gemini directly
+      execSync('gemini --version', { stdio: 'ignore' });
+      console.error('[Gemini MCP] Gemini CLI is available');
+      return true;
+    } catch {
+      console.error('[Gemini MCP] Cannot execute gemini command');
+      return false;
+    }
+  }
+}
 
 // Helper function to send message and get response in one shot
 async function sendOneShot(message: string): Promise<string> {
   return new Promise((resolve, reject) => {
     console.error(`[Gemini MCP] Sending: ${message.substring(0, 50)}...`);
     
-    // Escape quotes and special characters for shell
-    const escapedMessage = message.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
-    
-    // Use echo to pipe message into gemini
-    const geminiProcess = spawn('sh', ['-c', `echo "${escapedMessage}" | gemini`]);
+    // Spawn gemini process directly (no shell)
+    const geminiProcess = spawn('gemini', [], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+      cwd: process.cwd()
+    });
     
     let output = '';
     let error = '';
     let lastDataTime = Date.now();
     let timeoutHandle: NodeJS.Timeout;
+    let hasReceivedData = false;
+    
+    // Handle stdin errors
+    geminiProcess.stdin.on('error', (err) => {
+      console.error(`[Gemini MCP] stdin error: ${err.message}`);
+      reject(new Error(`Failed to write to Gemini process: ${err.message}`));
+    });
+    
+    // Write message to stdin
+    try {
+      geminiProcess.stdin.write(message + '\n');
+      geminiProcess.stdin.end();
+    } catch (err) {
+      console.error(`[Gemini MCP] Failed to write message: ${err}`);
+      reject(new Error(`Failed to send message to Gemini: ${err}`));
+      return;
+    }
     
     // Reset timeout whenever we receive data
     const resetTimeout = () => {
@@ -42,8 +80,14 @@ async function sendOneShot(message: string): Promise<string> {
     geminiProcess.stdout.on('data', (data) => {
       const chunk = data.toString();
       output += chunk;
+      hasReceivedData = true;
       lastDataTime = Date.now();
       resetTimeout();
+      
+      // Log first data received
+      if (!hasReceivedData) {
+        console.error(`[Gemini MCP] Started receiving response`);
+      }
       
       // Log progress for long responses
       if (output.length % 1000 === 0) {
@@ -52,7 +96,9 @@ async function sendOneShot(message: string): Promise<string> {
     });
     
     geminiProcess.stderr.on('data', (data) => {
-      error += data.toString();
+      const chunk = data.toString();
+      error += chunk;
+      console.error(`[Gemini MCP] stderr: ${chunk}`);
     });
     
     geminiProcess.on('close', (code) => {
@@ -60,24 +106,69 @@ async function sendOneShot(message: string): Promise<string> {
       
       const duration = Date.now() - lastDataTime;
       console.error(`[Gemini MCP] Process exited with code ${code} after ${duration}ms`);
+      console.error(`[Gemini MCP] Total output length: ${output.length}`);
+      console.error(`[Gemini MCP] Has received data: ${hasReceivedData}`);
       
-      if (code !== 0 && code !== null) {
-        reject(new Error(`Gemini process failed (code ${code}): ${error}`));
+      if (!hasReceivedData && error) {
+        console.error(`[Gemini MCP] No output received. Error: ${error}`);
+        reject(new Error(`Gemini failed to respond: ${error || 'No output received'}`));
+      } else if (code !== 0 && code !== null && !hasReceivedData) {
+        reject(new Error(`Gemini process failed (code ${code}): ${error || 'No output'}`));
       } else {
-        // Clean the output - remove "Loaded cached credentials." if present
+        // Clean the output - remove "Loaded cached credentials." and quota error messages
         const lines = output.split('\n');
-        const cleanedLines = lines.filter(line => !line.includes('Loaded cached credentials.'));
-        const cleanedOutput = cleanedLines.join('\n').trim();
+        let startProcessing = false;
+        let actualResponse = [];
+        
+        // Find where the actual response starts (after error messages)
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i];
+          if (line.includes('Loaded cached credentials.')) {
+            // Start collecting lines after this
+            startProcessing = true;
+            continue;
+          }
+          if (startProcessing) {
+            actualResponse.unshift(line);
+          }
+        }
+        
+        // If we found a response after "Loaded cached credentials.", use it
+        let cleanedOutput = actualResponse.join('\n').trim();
+        
+        // If no response found after credentials message, try to extract from full output
+        if (!cleanedOutput) {
+          // Look for common response patterns
+          const responseStartIndex = output.lastIndexOf('The user sent the following message:');
+          if (responseStartIndex !== -1) {
+            cleanedOutput = output.substring(responseStartIndex).trim();
+          } else {
+            // Fallback: remove known error patterns
+            cleanedOutput = lines
+              .filter(line => !line.includes('Loaded cached credentials.'))
+              .filter(line => !line.includes('Quota exceeded'))
+              .filter(line => !line.includes('GaxiosError'))
+              .filter(line => !line.includes('at async'))
+              .join('\n').trim();
+          }
+        }
         
         console.error(`[Gemini MCP] Response complete (${cleanedOutput.length} chars)`);
-        resolve(cleanedOutput);
+        resolve(cleanedOutput || output); // Fallback to raw output if nothing found
       }
     });
     
     geminiProcess.on('error', (err) => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
-      console.error(`[Gemini MCP] Process error: ${err}`);
-      reject(err);
+      console.error(`[Gemini MCP] Process spawn error: ${err.message}`);
+      console.error(`[Gemini MCP] Error details:`, err);
+      
+      // Check if gemini is installed
+      if (err.message.includes('ENOENT')) {
+        reject(new Error('Gemini CLI not found. Please ensure gemini is installed and in PATH'));
+      } else {
+        reject(new Error(`Failed to start Gemini process: ${err.message}`));
+      }
     });
   });
 }
@@ -105,6 +196,17 @@ Features:
   async ({ message }) => {
     try {
       console.error(`[Gemini MCP] Starting request at ${new Date().toISOString()}`);
+      
+      // Check if Gemini is available
+      if (!checkGeminiAvailable()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Gemini CLI is not installed or not in PATH. Please install Gemini CLI and ensure it's accessible."
+          }]
+        };
+      }
+      
       const startTime = Date.now();
       
       const response = await sendOneShot(message);
@@ -174,7 +276,7 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Gemini CLI MCP server v1.5.1 (one-shot mode) running");
+  console.error("Gemini CLI MCP server v1.5.4 (one-shot mode) running");
 }
 
 main().catch((error) => {
