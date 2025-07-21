@@ -1,23 +1,27 @@
 # Gemini CLI MCP Server
 
-An MCP (Model Context Protocol) server that enables Claude and other AI assistants to interact with Gemini CLI through tmux sessions.
+An MCP (Model Context Protocol) server that enables Claude and other AI assistants to interact with Gemini CLI using one-shot execution mode.
 
 ## Features
 
-- **Seamless Integration**: Send messages to Gemini CLI and receive responses
-- **Automatic Session Management**: Creates and manages tmux sessions automatically
-- **Permission Handling**: Handles Gemini's permission prompts for web fetching and tool usage
-- **Multiple Tools**: Send messages, check status, clear conversation, and close sessions
+- **One-Shot Execution**: Each message is sent independently without maintaining session state
+- **Instant Responses**: Direct execution without tmux overhead
 - **File Context Support**: Use @filename to reference files in your messages
-- **Debug Mode**: Get detailed execution information for troubleshooting
-- **Enhanced Response Detection**: Improved pattern matching for various response formats
-- **Smart Timeout**: Auto-detects search queries and adjusts timeout accordingly
-- **Detailed Session Status**: View conversation state, message count, and more
+- **Web Search**: Full support for Gemini's web search capabilities
+- **Korean & English**: Handles both languages seamlessly
+- **Simple & Reliable**: No complex session management or response capture issues
+
+## Why One-Shot Mode?
+
+Version 1.5.0 represents a major architectural change from tmux-based interactive sessions to one-shot execution:
+
+- **Previous versions (1.0.0 - 1.4.4)** used tmux to maintain persistent Gemini CLI sessions, which proved unstable with frequent response capture failures
+- **Version 1.5.0** executes each message independently using pipe input (`echo "message" | gemini`), eliminating session state complexity
+- **Trade-off**: No conversation history between messages, but significantly improved reliability
 
 ## Prerequisites
 
 - Node.js v18 or higher
-- tmux installed (`sudo apt install tmux` on Ubuntu/Debian)
 - Gemini CLI installed and configured
 - An MCP-compatible client (like Claude Desktop)
 
@@ -90,86 +94,47 @@ Send a message to Gemini CLI and get the response.
 **Parameters:**
 - `message` (required): The message to send to Gemini
   - Supports @filename references (e.g., "@package.json explain this")
-- `working_directory` (optional): Working directory for new sessions and file resolution
-- `timeout` (optional): Response timeout in milliseconds
-  - Auto-detected based on message type:
-    - Search queries: 30 seconds (검색, search, find, news, latest)
-    - Simple queries: 10 seconds
-  - Can be manually set for specific needs
-- `auto_permission` (optional): How to handle permission requests
-  - `"once"` (default): Allow once
-  - `"always"`: Allow always
-  - `"no"`: Deny
-- `debug` (optional): Enable debug mode for detailed execution information
+  - Supports web search queries in any language
+  - Each message is independent (no conversation history)
 
 **Examples:**
 ```
 Use gemini_send to ask "What is the weather today?"
-Use gemini_send with message "@src/index.ts explain this code" and debug true
+Use gemini_send with message "@src/index.ts explain this code"
+Use gemini_send with message "최신 AI 뉴스 검색해줘"
 ```
 
-### 2. `gemini_session_status`
-Check if a Gemini CLI session is active and see detailed information.
-
-**Parameters:**
-- `lines` (optional): Number of recent output lines to show (default: 20)
-- `full_output` (optional): Show full session output instead of recent lines
-- `debug` (optional): Include detailed session information
-
-**Session Details Include:**
-- Current state (idle, processing, searching, waiting_permission)
-- Message count in conversation
-- Session creation time
-- Pane size and attachment status
+### 2. `gemini_status`
+Check if Gemini CLI is available and working.
 
 **Example:**
 ```
-Check the Gemini session status with debug true
-```
-
-### 3. `gemini_clear`
-Clear the current Gemini conversation history.
-
-**Parameters:**
-- `debug` (optional): Show debug information about the clear operation
-
-**Example:**
-```
-Clear the Gemini conversation
-```
-
-### 4. `gemini_close`
-Close the current Gemini CLI session.
-
-**Example:**
-```
-Close the Gemini session
+Check if Gemini is working
 ```
 
 ## How It Works
 
-1. **Session Management**: The server creates a tmux session named `gemini-ai` when first sending a message
-2. **Message Handling**: Messages are sent using `tmux send-keys` commands
-   - File references (@filename) are automatically expanded to absolute paths
-   - Messages are preprocessed before sending
-3. **Response Capture**: The server captures the tmux pane output and extracts Gemini's response
-   - Uses regex patterns to detect various response formats
-   - Detects processing indicators (⠦, ⠴, ⠼, "Translating", "Searching")
-   - Handles code blocks, boxes, and list formatting
-   - Waits for response completion with intelligent timeout
-   - Auto-adjusts timeout based on query type
-4. **Permission Handling**: When Gemini asks for permissions (e.g., for web fetching), the server can automatically respond based on the `auto_permission` setting
+1. **One-Shot Execution**: Each message is piped directly to Gemini CLI using shell command: `echo "message" | gemini`
+2. **Message Handling**: Messages are passed as-is to Gemini
+   - File references (@filename) work with relative paths from current directory
+   - Special characters are properly escaped for shell execution
+3. **Response Capture**: The server captures stdout from the Gemini process
+   - Filters out "Loaded cached credentials." messages
+   - Returns the complete response immediately
+4. **No State Management**: Each execution is completely independent
+   - No tmux sessions to manage
+   - No conversation history maintained
+   - No complex response detection needed
 
 ## Important Notes
 
-- **Automatic Session Cleanup**: The MCP server automatically cleans up any existing Gemini sessions when it starts, ensuring a fresh environment
+- **No Conversation History**: Each message is independent - Gemini won't remember previous messages
 - **Response Times**: 
-  - Simple queries: 5-10 seconds
-  - Search queries: 15-30 seconds (includes web searching)
-  - The server automatically detects search queries and adjusts timeout
-- **Asynchronous Nature**: Gemini CLI processes requests asynchronously, so patience is required
-- **Debug Logs**: Check stderr output for detailed processing information
-- **Tool Descriptions**: Each tool now includes detailed descriptions to help LLMs understand their purpose and usage
+  - Simple queries: 2-5 seconds
+  - Search queries: 5-15 seconds (includes web searching)
+  - File analysis: 3-10 seconds depending on file size
+- **Current Directory**: File references (@filename) are resolved from the current working directory
+- **Error Handling**: If Gemini CLI is not available or fails, clear error messages are returned
 
 ## Development
 
@@ -201,40 +166,33 @@ gemini-mcp-server/
 
 ### Common Issues
 
-1. **"tmux: command not found"**
-   - Install tmux: `sudo apt install tmux` (Ubuntu/Debian) or `brew install tmux` (macOS)
-
-2. **"gemini: command not found"**
+1. **"gemini: command not found"**
    - Ensure Gemini CLI is installed and in your PATH
    - Try running `gemini` in your terminal to verify
+   - Check if you need to run `gemini auth` first
 
-3. **Session Already Exists**
-   - The server automatically cleans up old sessions on startup
-   - Use `gemini_close` to manually close if needed
+2. **No Response or Empty Response**
+   - Check if Gemini CLI works manually: `echo "Hello" | gemini`
+   - Ensure you have proper authentication
+   - Check stderr logs for error messages
 
-4. **Empty or No Response**
-   - Check stderr logs for debugging information
-   - Use `gemini_session_status` to see the actual session state
-   - Increase timeout for complex queries (especially searches)
-   - The server now has improved response detection (v1.3.0)
-
-5. **Response Timeout**
-   - Search queries need 20-30 seconds
-   - Simple queries need 5-10 seconds
-   - Manual timeout can be set if needed
+3. **File Not Found (@filename)**
+   - File references are resolved from the current working directory
+   - Use relative paths from where the MCP server is running
+   - Absolute paths also work if needed
 
 ### Debug Tips
 
-- Check tmux sessions: `tmux ls`
-- Attach to the session manually: `tmux attach -t gemini-ai`
-- View server logs in your MCP client's debug console
+- Test Gemini CLI directly: `echo "test message" | gemini`
+- Check MCP server logs in stderr output
+- Use `gemini_status` tool to verify Gemini is working
 
 ## Security Considerations
 
-- The server executes shell commands via tmux
+- The server executes shell commands to run Gemini CLI
+- Messages are escaped but still use shell execution
 - Only use in trusted environments
-- Be cautious with the `working_directory` parameter
-- Consider the implications of automatic permission handling
+- Be cautious with untrusted input
 
 ## Contributing
 
@@ -248,37 +206,28 @@ Contributions are welcome! Please:
 
 ## Changelog
 
-### Version 1.4.1
-- Fixed message sending issues with tmux send-keys -l flag for literal text
-- Simplified response capture logic to improve reliability
-- Enhanced debug output to show actual command execution results
-- Improved session creation with better error handling
-- Extended wait time after sending messages for better stability
-- Fixed issues where messages weren't being sent properly
+### Version 1.5.1
+- **Improved timeout handling**: Dynamic timeout that resets when data is received
+- **Better long response support**: 60-second timeout between data chunks instead of total timeout
+- **Progress logging**: Shows data received for long responses
+- **More robust process handling**: Properly handles process exit codes including null
+- **Added timing information**: Logs request duration for debugging
 
-### Version 1.4.0
-- Added enhanced response detection with regex patterns
-- Implemented debug mode for all tools
-- Added file context support (@filename preprocessing) 
-- Improved error handling with recovery suggestions
-- Enhanced session status with detailed information
-- Better handling of code blocks, boxes, and formatted content
-- Smarter timeout detection based on query type
+### Version 1.5.0 (Major Architecture Change)
+- **Complete rewrite**: Switched from tmux-based sessions to one-shot execution
+- **Removed tmux dependency**: Now uses direct pipe input (`echo "message" | gemini`)
+- **Eliminated session management**: Each message is independent, no state maintained
+- **Improved reliability**: No more response capture failures or timeout issues
+- **Faster responses**: Direct execution without tmux overhead
+- **Simplified codebase**: Removed complex response detection and session management
+- **Trade-off**: No conversation history, but much more stable operation
 
-### Version 1.3.0
-- Improved response capture logic
-- Fixed issue where MCP wasn't waiting for responses
-- Added better content detection and stability checks
-
-### Version 1.2.0
-- Added detailed tool descriptions
-- Implemented automatic session cleanup on startup
-- Fixed stale session issues
-
-### Version 1.1.0
-- Fixed message sending with proper quote escaping
-- Added auto-detection for search queries with longer timeouts
-- Improved processing indicator detection
+### Previous Versions (1.0.0 - 1.4.4)
+- Used tmux for persistent session management
+- Attempted various fixes for response capture issues
+- Complex pattern matching and timeout logic
+- Frequent failures in message detection and response extraction
+- Shell mode activation problems, especially with Korean input
 
 ## License
 

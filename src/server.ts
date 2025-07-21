@@ -3,333 +3,83 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { exec, spawn } from "child_process";
-import { promisify } from "util";
-import * as fs from "fs";
-import * as path from "path";
-
-const execAsync = promisify(exec);
-
-// Tmux session configuration
-const SESSION_NAME = "gemini-ai";
-const DEFAULT_TIMEOUT = 30000; // 30 seconds default timeout (for search queries)
-const SIMPLE_TIMEOUT = 10000; // 10 seconds for simple queries
-const PERMISSION_TIMEOUT = 3000; // 3 seconds for permission responses
+import { spawn } from "child_process";
 
 // Create MCP server
 const server = new McpServer({
   name: "gemini-cli",
-  version: "1.4.1",
-  description: "MCP server for interacting with Gemini CLI via tmux"
+  version: "1.5.1",
+  description: "MCP server for interacting with Gemini CLI (one-shot mode)"
 });
 
-// Response detection patterns
-const responsePatterns = {
-  geminiStart: /^✦\s+/m,
-  boxContent: /^│\s+/m,
-  boxBorder: /^[╭╰─┤├]/m,
-  codeBlock: /^```/m,
-  listItem: /^[\d•\-]\.\s+/m,
-  promptReturn: /^Using \d+ MCP/m,
-  geminiPrompt: /gemini>/,
-  processing: /[⠦⠴⠼⠹⠸⠧]/,
-  searchingStatus: /(?:Searching|Translating|GoogleSearch|Processing|Thinking)/i,
-  emptyLine: /^\s*$/
-};
-
-// Debug info interface
-interface DebugInfo {
-  rawOutput: string;
-  tmuxCommands: string[];
-  timings: Array<{ step: string; duration: number }>;
-  sessionInfo: any;
-}
-
-// Debug tracking
-let debugInfo: DebugInfo = {
-  rawOutput: "",
-  tmuxCommands: [],
-  timings: [],
-  sessionInfo: {}
-};
-
-function trackTiming(step: string, startTime: number) {
-  debugInfo.timings.push({
-    step,
-    duration: Date.now() - startTime
-  });
-}
-
-function trackCommand(command: string) {
-  debugInfo.tmuxCommands.push(command);
-}
-
-// File context preprocessing
-function preprocessMessage(message: string, workingDir: string = process.cwd()): string {
-  // Replace @filename references with absolute paths
-  return message.replace(/@(\S+)/g, (match, filename) => {
-    // Skip if it's already an absolute path
-    if (path.isAbsolute(filename)) {
-      return match;
-    }
+// Helper function to send message and get response in one shot
+async function sendOneShot(message: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    console.error(`[Gemini MCP] Sending: ${message.substring(0, 50)}...`);
     
-    const absolutePath = path.resolve(workingDir, filename);
+    // Escape quotes and special characters for shell
+    const escapedMessage = message.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
     
-    // Check if file exists
-    if (fs.existsSync(absolutePath)) {
-      console.error(`[Gemini MCP] Expanded ${match} to ${absolutePath}`);
-      return `@${absolutePath}`;
-    } else {
-      console.error(`[Gemini MCP] Warning: File not found for ${match}`);
-      return match;
-    }
-  });
-}
-
-// Helper functions
-async function checkSession(): Promise<boolean> {
-  try {
-    await execAsync(`tmux has-session -t ${SESSION_NAME} 2>&1`);
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
-async function createSession(workingDir?: string): Promise<void> {
-  const cwd = workingDir || process.cwd();
-  
-  try {
-    // Create session with gemini command
-    await execAsync(`tmux new-session -d -s ${SESSION_NAME} -c "${cwd}" 'gemini'`);
-    console.error(`[Gemini MCP] Created new session in ${cwd}`);
+    // Use echo to pipe message into gemini
+    const geminiProcess = spawn('sh', ['-c', `echo "${escapedMessage}" | gemini`]);
     
-    // Wait for Gemini to fully initialize
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    let output = '';
+    let error = '';
+    let lastDataTime = Date.now();
+    let timeoutHandle: NodeJS.Timeout;
     
-    // Send an initial Enter to clear any startup messages
-    await execAsync(`tmux send-keys -t ${SESSION_NAME} Enter`);
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // Reset timeout whenever we receive data
+    const resetTimeout = () => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      timeoutHandle = setTimeout(() => {
+        console.error('[Gemini MCP] No data received for 60 seconds, assuming complete');
+        geminiProcess.kill();
+      }, 60000); // 60 second timeout since last data
+    };
     
-  } catch (error) {
-    console.error(`[Gemini MCP] Failed to create session: ${error}`);
-    throw error;
-  }
-}
-
-async function sendMessage(message: string, debug: boolean = false): Promise<void> {
-  try {
-    // Use -l flag for literal text - this handles all special characters properly
-    const sendCmd = `tmux send-keys -t ${SESSION_NAME} -l "${message.replace(/"/g, '\\"')}"`;
-    const enterCmd = `tmux send-keys -t ${SESSION_NAME} Enter`;
+    resetTimeout();
     
-    if (debug) {
-      trackCommand(sendCmd);
-      trackCommand(enterCmd);
-      console.error(`[Gemini MCP Debug] Sending message: "${message}"`);
-    }
-    
-    // Execute and capture any errors
-    const { stdout: sendOut, stderr: sendErr } = await execAsync(sendCmd);
-    if (debug && sendErr) {
-      console.error(`[Gemini MCP Debug] Send command stderr: ${sendErr}`);
-    }
-    
-    const { stdout: enterOut, stderr: enterErr } = await execAsync(enterCmd);
-    if (debug && enterErr) {
-      console.error(`[Gemini MCP Debug] Enter command stderr: ${enterErr}`);
-    }
-    
-    // Give tmux time to process the keys
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-  } catch (error) {
-    console.error(`[Gemini MCP] Error in sendMessage: ${error}`);
-    throw error;
-  }
-}
-
-async function captureResponse(timeout: number = DEFAULT_TIMEOUT, debug: boolean = false): Promise<string> {
-  const startTime = Date.now();
-  let lastOutput = "";
-  let stableCount = 0;
-  let hasSeenProcessing = false;
-  
-  if (debug) {
-    console.error(`[Gemini MCP Debug] Starting response capture with ${timeout}ms timeout`);
-  }
-  
-  while (Date.now() - startTime < timeout) {
-    try {
-      const captureCmd = `tmux capture-pane -t ${SESSION_NAME} -p -S -`;
-      if (debug) trackCommand(captureCmd);
+    geminiProcess.stdout.on('data', (data) => {
+      const chunk = data.toString();
+      output += chunk;
+      lastDataTime = Date.now();
+      resetTimeout();
       
-      const { stdout } = await execAsync(captureCmd);
-      
-      // Store raw output for debug
-      if (debug) {
-        debugInfo.rawOutput = stdout;
+      // Log progress for long responses
+      if (output.length % 1000 === 0) {
+        console.error(`[Gemini MCP] Receiving data... ${output.length} chars so far`);
       }
+    });
+    
+    geminiProcess.stderr.on('data', (data) => {
+      error += data.toString();
+    });
+    
+    geminiProcess.on('close', (code) => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
       
-      // Simple processing detection
-      if (stdout.includes("⠦") || stdout.includes("⠴") || stdout.includes("⠼") || 
-          stdout.includes("Translating") || stdout.includes("Searching") || 
-          stdout.includes("Processing") || stdout.includes("GoogleSearch")) {
-        hasSeenProcessing = true;
-        if (debug) console.error("[Gemini MCP Debug] Processing indicators detected");
-      }
+      const duration = Date.now() - lastDataTime;
+      console.error(`[Gemini MCP] Process exited with code ${code} after ${duration}ms`);
       
-      // Check if output has changed
-      if (stdout !== lastOutput) {
-        stableCount = 0;
-        lastOutput = stdout;
-        if (debug) console.error("[Gemini MCP Debug] Output changed, resetting stability counter");
+      if (code !== 0 && code !== null) {
+        reject(new Error(`Gemini process failed (code ${code}): ${error}`));
       } else {
-        stableCount++;
+        // Clean the output - remove "Loaded cached credentials." if present
+        const lines = output.split('\n');
+        const cleanedLines = lines.filter(line => !line.includes('Loaded cached credentials.'));
+        const cleanedOutput = cleanedLines.join('\n').trim();
         
-        // Simple completion check - if output is stable and we've seen processing
-        if (stableCount >= 3 && hasSeenProcessing) {
-          // Make sure processing is done
-          if (!stdout.includes("⠦") && !stdout.includes("⠴") && !stdout.includes("⠼") &&
-              !stdout.includes("Translating") && !stdout.includes("Searching")) {
-            if (debug) console.error("[Gemini MCP Debug] Response appears complete");
-            return stdout;
-          }
-        }
+        console.error(`[Gemini MCP] Response complete (${cleanedOutput.length} chars)`);
+        resolve(cleanedOutput);
       }
-      
-      // Check for permission UI
-      if (stdout.includes("Do you want to proceed?")) {
-        if (debug) console.error("[Gemini MCP Debug] Permission prompt detected");
-        return stdout;
-      }
-      
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    } catch (error) {
-      console.error(`[Gemini MCP] Error capturing response: ${error}`);
-      if (debug) throw error;
-    }
-  }
-  
-  if (debug) {
-    console.error(`[Gemini MCP Debug] Timeout after ${Date.now() - startTime}ms`);
-  }
-  return lastOutput;
-}
-
-async function handlePermissionRequest(allowance: "once" | "always" | "no" = "once"): Promise<void> {
-  switch (allowance) {
-    case "once":
-      // Default selection, just press Enter
-      await execAsync(`tmux send-keys -t ${SESSION_NAME} Enter`);
-      break;
-    case "always":
-      // Navigate down and press Enter
-      await execAsync(`tmux send-keys -t ${SESSION_NAME} Down`);
-      await execAsync(`tmux send-keys -t ${SESSION_NAME} Enter`);
-      break;
-    case "no":
-      // Navigate down twice or send Escape
-      await execAsync(`tmux send-keys -t ${SESSION_NAME} Escape`);
-      break;
-  }
-}
-
-function extractGeminiResponse(fullOutput: string, userMessage: string, debug: boolean = false): string {
-  const lines = fullOutput.split('\n');
-  let messageIndex = -1;
-  
-  if (debug) {
-    console.error(`[Gemini MCP Debug] Extracting response from ${lines.length} lines`);
-    console.error(`[Gemini MCP Debug] Looking for message: "${userMessage}"`);
-  }
-  
-  // Find where the user message appears
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(userMessage)) {
-      messageIndex = i;
-      if (debug) console.error(`[Gemini MCP Debug] Found user message at line ${i}`);
-      break;
-    }
-  }
-  
-  if (messageIndex === -1) {
-    // Try partial match for long messages
-    if (userMessage.length > 20) {
-      const partial = userMessage.substring(0, 20);
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].includes(partial)) {
-          messageIndex = i;
-          if (debug) console.error(`[Gemini MCP Debug] Found partial message at line ${i}`);
-          break;
-        }
-      }
-    }
-  }
-  
-  if (messageIndex === -1) {
-    // Look for any processing indicator as a starting point
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (lines[i].includes('✦') || lines[i].includes('⠴') || lines[i].includes('⠼')) {
-        messageIndex = i;
-        if (debug) console.error(`[Gemini MCP Debug] Found processing indicator at line ${i}`);
-        break;
-      }
-    }
-  }
-  
-  if (messageIndex === -1) {
-    if (debug) console.error("[Gemini MCP Debug] No reference point found");
-    return fullOutput.trim();
-  }
-  
-  // Extract response - simple approach
-  const responseLines = [];
-  let foundContent = false;
-  
-  for (let i = messageIndex + 1; i < lines.length; i++) {
-    const line = lines[i];
+    });
     
-    // Skip initial processing indicators
-    if (!foundContent && (
-      line.includes('⠦') || line.includes('⠴') || line.includes('⠼') ||
-      line.includes('✦') || line.includes('Translating') || 
-      line.includes('Searching') || line.includes('GoogleSearch') ||
-      line.trim() === ''
-    )) {
-      continue;
-    }
-    
-    // Stop at next prompt
-    if (line.includes('gemini>') || line.includes('shell mode enabled')) {
-      break;
-    }
-    
-    // We found actual content
-    if (line.trim() !== '') {
-      foundContent = true;
-    }
-    
-    if (foundContent || line.trim() !== '') {
-      responseLines.push(line);
-    }
-  }
-  
-  // Trim trailing empty lines
-  while (responseLines.length > 0 && responseLines[responseLines.length - 1].trim() === '') {
-    responseLines.pop();
-  }
-  
-  const response = responseLines.join('\n');
-  
-  if (debug) {
-    console.error(`[Gemini MCP Debug] Extracted ${responseLines.length} lines`);
-    if (response.length === 0) {
-      console.error("[Gemini MCP Debug] Empty response - check raw output");
-    }
-  }
-  
-  return response;
+    geminiProcess.on('error', (err) => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      console.error(`[Gemini MCP] Process error: ${err}`);
+      reject(err);
+    });
+  });
 }
 
 // Register main tool for sending messages
@@ -337,280 +87,39 @@ server.registerTool(
   "gemini_send",
   {
     title: "Send Message to Gemini CLI",
-    description: `Send a message to Gemini CLI and receive the response. 
+    description: `Send a message to Gemini CLI and receive the response using one-shot execution.
     
-This tool manages a tmux session automatically:
-- Creates a new session if none exists
-- Sends your message to Gemini
-- Waits for and captures the complete response
-- Handles permission requests for web searches automatically
-- Supports @filename references (automatically expands to absolute paths)
-
-Response times vary:
-- Simple queries: 5-10 seconds
-- Search/web queries: 15-30 seconds (auto-detected)
+This tool executes Gemini CLI in a stateless manner - each message is independent.
+No session management or conversation history is maintained.
 
 Features:
-- File context: Use @filename to reference files
-- Debug mode: Returns detailed execution information
-- Enhanced response detection with pattern matching
-
-Example: Ask Gemini to search for news, explain concepts, or analyze @package.json.`,
+- Instant execution without tmux
+- File context support with @filename  
+- Handles Korean and English input
+- Web search capabilities
+- No session state to manage`,
     inputSchema: {
-      message: z.string().describe("The message to send to Gemini. Supports @filename references"),
-      working_directory: z.string().optional().describe("Working directory for the session and @filename resolution"),
-      timeout: z.number().optional().describe("Response timeout in milliseconds (default: auto-detected based on message type)"),
-      auto_permission: z.enum(["once", "always", "no"]).optional().describe("How to handle permission requests (default: once)"),
-      debug: z.boolean().optional().describe("Enable debug mode to get detailed execution information")
+      message: z.string().describe("The message to send to Gemini")
     }
   },
-  async ({ message, working_directory, timeout, auto_permission = "once", debug = false }) => {
+  async ({ message }) => {
     try {
-      // Reset debug info for new request
-      if (debug) {
-        debugInfo = {
-          rawOutput: "",
-          tmuxCommands: [],
-          timings: [],
-          sessionInfo: {}
-        };
-      }
-      
+      console.error(`[Gemini MCP] Starting request at ${new Date().toISOString()}`);
       const startTime = Date.now();
       
-      // Preprocess message for file references
-      const workDir = working_directory || process.cwd();
-      const processedMessage = preprocessMessage(message, workDir);
-      if (processedMessage !== message) {
-        console.error("[Gemini MCP] Message preprocessed with file paths");
-      }
+      const response = await sendOneShot(message);
       
-      // Auto-detect timeout based on message content
-      if (!timeout) {
-        const lowerMessage = processedMessage.toLowerCase();
-        if (lowerMessage.includes('search') || lowerMessage.includes('검색') || 
-            lowerMessage.includes('find') || lowerMessage.includes('찾') ||
-            lowerMessage.includes('news') || lowerMessage.includes('뉴스') ||
-            lowerMessage.includes('latest') || lowerMessage.includes('최신')) {
-          timeout = DEFAULT_TIMEOUT; // 30 seconds for search queries
-          console.error("[Gemini MCP] Detected search query, using 30s timeout");
-        } else {
-          timeout = SIMPLE_TIMEOUT; // 10 seconds for simple queries
-          console.error("[Gemini MCP] Using 10s timeout for simple query");
-        }
-      }
+      const duration = Date.now() - startTime;
+      console.error(`[Gemini MCP] Request completed in ${duration}ms`);
       
-      // Check if session exists, create if not
-      const sessionExists = await checkSession();
-      if (!sessionExists) {
-        console.error("[Gemini MCP] Creating new session...");
-        await createSession(working_directory);
-      }
-      
-      if (debug) {
-        debugInfo.sessionInfo = {
-          exists: sessionExists,
-          workingDirectory: workDir,
-          timeout: timeout
-        };
-      }
-      
-      // Log the message being sent
-      console.error(`[Gemini MCP] Sending message: ${processedMessage}`);
-      
-      // Send the message
-      await sendMessage(processedMessage, debug);
-      
-      // Wait longer for Gemini to process the message
-      console.error("[Gemini MCP] Waiting for Gemini to process message...");
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      
-      // Capture initial response
-      let response = await captureResponse(timeout, debug);
-      
-      // Check if permission is needed
-      if (response.includes("Do you want to proceed?")) {
-        // Handle permission
-        await handlePermissionRequest(auto_permission);
-        
-        // Wait for actual response after permission
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        response = await captureResponse(timeout, debug);
-      }
-      
-      // Extract just the Gemini response
-      const geminiResponse = extractGeminiResponse(response, processedMessage, debug);
-      
-      // Debug log the response
-      console.error(`[Gemini MCP] Raw response length: ${response.length}`);
-      console.error(`[Gemini MCP] Extracted response length: ${geminiResponse.length}`);
-      
-      // If we got an empty response, log the full output for debugging
-      if (!geminiResponse || geminiResponse.trim().length === 0) {
-        console.error("[Gemini MCP] Empty response detected. Check debug info if enabled.");
-      }
-      
-      trackTiming("total_execution", startTime);
-      
-      // Prepare response
-      const responseText = geminiResponse || "No response captured. Check session status or increase timeout.";
-      
-      if (debug) {
-        // Return debug information along with response
-        const debugText = [
-          `Response:\n${responseText}`,
-          `\n--- Debug Information ---`,
-          `Total execution time: ${Date.now() - startTime}ms`,
-          `Session existed: ${sessionExists}`,
-          `Message sent: "${processedMessage}"`,
-          `Timeout used: ${timeout}ms`,
-          `\nCommands executed (${debugInfo.tmuxCommands.length}):`,
-          ...debugInfo.tmuxCommands.map((cmd, i) => `  ${i+1}. ${cmd}`),
-          `\nRaw output sample (last 500 chars):`,
-          debugInfo.rawOutput.slice(-500),
-          `\nExtracted response: ${geminiResponse.length} chars`
-        ].join('\n');
-        
+      if (!response) {
         return {
           content: [{
             type: "text",
-            text: debugText
-          }]
-        };
-      } else {
-        return {
-          content: [{
-            type: "text",
-            text: responseText
+            text: "No response received from Gemini. Please try again."
           }]
         };
       }
-      
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error(`[Gemini MCP] Error: ${errorMsg}`);
-      
-      // Provide helpful error suggestions
-      let suggestion = "";
-      if (errorMsg.includes("tmux")) {
-        suggestion = "\n\nSuggestion: Make sure tmux is installed (sudo apt install tmux)";
-      } else if (errorMsg.includes("session")) {
-        suggestion = "\n\nSuggestion: Try closing the session with gemini_close and retry";
-      }
-      
-      return {
-        content: [{
-          type: "text",
-          text: `Error: ${errorMsg}${suggestion}`
-        }]
-      };
-    }
-  }
-);
-
-// Helper function to get session details
-async function getSessionDetails(): Promise<any> {
-  try {
-    // Get session info
-    const { stdout: sessionInfo } = await execAsync(`tmux list-sessions -F "#{session_name}:#{session_created}:#{session_attached}" 2>/dev/null | grep "^${SESSION_NAME}:" || echo ""`);
-    
-    // Get pane info
-    const { stdout: paneInfo } = await execAsync(`tmux list-panes -t ${SESSION_NAME} -F "#{pane_width}x#{pane_height}" 2>/dev/null || echo ""`);
-    
-    // Get full output to analyze
-    const { stdout: fullOutput } = await execAsync(`tmux capture-pane -t ${SESSION_NAME} -p 2>/dev/null || echo ""`);
-    
-    // Count messages
-    const messageCount = (fullOutput.match(/gemini>/g) || []).length;
-    
-    // Detect current state
-    let currentState = "idle";
-    if (responsePatterns.processing.test(fullOutput)) {
-      currentState = "processing";
-    } else if (responsePatterns.searchingStatus.test(fullOutput)) {
-      currentState = "searching";
-    } else if (fullOutput.includes("Do you want to proceed?")) {
-      currentState = "waiting_permission";
-    }
-    
-    // Parse session info
-    const [name, created, attached] = sessionInfo.trim().split(':');
-    
-    return {
-      active: true,
-      sessionName: name || SESSION_NAME,
-      created: created ? new Date(parseInt(created) * 1000).toISOString() : null,
-      attached: attached === "1",
-      paneSize: paneInfo.trim() || "unknown",
-      messageCount: messageCount,
-      currentState: currentState,
-      lastActivity: new Date().toISOString()
-    };
-  } catch {
-    return { active: false };
-  }
-}
-
-// Register session status tool
-server.registerTool(
-  "gemini_session_status",
-  {
-    title: "Check Gemini Session Status",
-    description: `Check if a Gemini CLI session is active and view detailed information.
-
-This tool provides:
-- Session existence and creation time
-- Current state (idle, processing, searching, waiting_permission)
-- Message count in conversation
-- Pane size and attachment status
-- Recent output (configurable lines)
-- Debug information if enabled
-
-Useful for debugging, monitoring long-running queries, and understanding session state.`,
-    inputSchema: {
-      lines: z.number().optional().describe("Number of recent output lines to show (default: 20)"),
-      full_output: z.boolean().optional().describe("Show full session output instead of just recent lines"),
-      debug: z.boolean().optional().describe("Include detailed session information")
-    }
-  },
-  async ({ lines = 20, full_output = false, debug = false }) => {
-    try {
-      const exists = await checkSession();
-      if (!exists) {
-        return {
-          content: [{
-            type: "text",
-            text: "No active Gemini session"
-          }]
-        };
-      }
-      
-      // Get session details
-      const details = await getSessionDetails();
-      
-      // Get output
-      let output;
-      if (full_output) {
-        const { stdout } = await execAsync(`tmux capture-pane -t ${SESSION_NAME} -p`);
-        output = stdout;
-      } else {
-        const { stdout } = await execAsync(`tmux capture-pane -t ${SESSION_NAME} -p | tail -${lines}`);
-        output = stdout;
-      }
-      
-      // Build response
-      let response = "Session Status: ACTIVE\n";
-      
-      if (debug || details.currentState !== "idle") {
-        response += `\nSession Details:\n`;
-        response += `- State: ${details.currentState}\n`;
-        response += `- Messages: ${details.messageCount}\n`;
-        response += `- Created: ${details.created || "unknown"}\n`;
-        response += `- Pane Size: ${details.paneSize}\n`;
-        response += `- Attached: ${details.attached ? "Yes" : "No"}\n`;
-      }
-      
-      response += `\n${full_output ? "Full" : `Last ${lines} lines of`} output:\n${"─".repeat(50)}\n${output}`;
       
       return {
         content: [{
@@ -620,164 +129,52 @@ Useful for debugging, monitoring long-running queries, and understanding session
       };
       
     } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error(`[Gemini MCP] Error: ${error}`);
       return {
         content: [{
           type: "text",
-          text: `Error checking session: ${errorMsg}`
+          text: `Error: ${error instanceof Error ? error.message : String(error)}`
         }]
       };
     }
   }
 );
 
-// Register clear conversation tool
+// Register status tool
 server.registerTool(
-  "gemini_clear",
+  "gemini_status",
   {
-    title: "Clear Gemini Conversation",
-    description: `Clear the current Gemini conversation history while keeping the session active.
-
-This tool:
-- Sends the /clear command to Gemini
-- Resets the conversation context
-- Keeps the tmux session running
-- Useful when starting a new topic or if context becomes confused
-
-Note: This does NOT close the session, just clears the conversation.`,
-    inputSchema: {
-      debug: z.boolean().optional().describe("Show debug information about the clear operation")
-    }
-  },
-  async ({ debug = false }) => {
-    try {
-      const startTime = Date.now();
-      
-      const exists = await checkSession();
-      if (!exists) {
-        return {
-          content: [{
-            type: "text",
-            text: "No active session to clear"
-          }]
-        };
-      }
-      
-      // Get before state if debug
-      let beforeState;
-      if (debug) {
-        beforeState = await getSessionDetails();
-      }
-      
-      // Send /clear command
-      await sendMessage("/clear", debug);
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Get after state if debug
-      let afterState;
-      if (debug) {
-        afterState = await getSessionDetails();
-      }
-      
-      let response = "Conversation cleared";
-      
-      if (debug) {
-        response += `\n\nDebug Info:\n`;
-        response += `- Execution time: ${Date.now() - startTime}ms\n`;
-        response += `- Messages before: ${beforeState.messageCount}\n`;
-        response += `- Messages after: ${afterState.messageCount}\n`;
-        response += `- State after: ${afterState.currentState}`;
-      }
-      
-      return {
-        content: [{
-          type: "text",
-          text: response
-        }]
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error clearing conversation: ${error instanceof Error ? error.message : String(error)}`
-        }]
-      };
-    }
-  }
-);
-
-// Register close session tool
-server.registerTool(
-  "gemini_close",
-  {
-    title: "Close Gemini Session",
-    description: `Close the current Gemini CLI tmux session completely.
-
-This tool:
-- Terminates the tmux session named 'gemini-ai'
-- Frees up system resources
-- Should be used when done with Gemini interactions
-
-Note: A new session will be automatically created on the next gemini_send call.
-The MCP server automatically cleans up old sessions on startup, so manual closing is optional.`,
+    title: "Check Gemini CLI Status",
+    description: "Check if Gemini CLI is available and working",
     inputSchema: {}
   },
   async () => {
     try {
-      const exists = await checkSession();
-      if (!exists) {
-        return {
-          content: [{
-            type: "text",
-            text: "No active session to close"
-          }]
-        };
-      }
-      
-      // Kill the tmux session
-      await execAsync(`tmux kill-session -t ${SESSION_NAME}`);
+      // Send a simple test message
+      const response = await sendOneShot("Hello");
       
       return {
         content: [{
           type: "text",
-          text: "Gemini session closed"
+          text: `Gemini CLI is working. Test response: ${response.substring(0, 100)}...`
         }]
       };
     } catch (error) {
       return {
         content: [{
           type: "text",
-          text: `Error closing session: ${error instanceof Error ? error.message : String(error)}`
+          text: `Gemini CLI is not responding: ${error instanceof Error ? error.message : String(error)}`
         }]
       };
     }
   }
 );
 
-// Cleanup function to remove stale sessions
-async function cleanupStaleSessions() {
-  try {
-    // Check if there's an existing session
-    const sessionExists = await checkSession();
-    if (sessionExists) {
-      console.error("[Gemini MCP] Found existing session, cleaning up...");
-      await execAsync(`tmux kill-session -t ${SESSION_NAME}`);
-      console.error("[Gemini MCP] Previous session cleaned up");
-    }
-  } catch (error) {
-    // Session doesn't exist or already cleaned, which is fine
-    console.error("[Gemini MCP] No previous session found");
-  }
-}
-
 // Start the server
 async function main() {
-  // Clean up any stale sessions on startup
-  await cleanupStaleSessions();
-  
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Gemini CLI MCP server running on stdio");
+  console.error("Gemini CLI MCP server v1.5.1 (one-shot mode) running");
 }
 
 main().catch((error) => {
