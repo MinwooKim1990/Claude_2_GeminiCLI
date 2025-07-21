@@ -27,7 +27,7 @@ An MCP (Model Context Protocol) server that enables Claude and other AI assistan
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/MinwooKim1990/Claude_2_GeminiCLI.git
 cd gemini-mcp-server
 ```
 
@@ -247,6 +247,14 @@ Contributions are welcome! Please:
 5. Submit a pull request
 
 ## Changelog
+
+### Version 1.4.1
+- Fixed message sending issues with tmux send-keys -l flag for literal text
+- Simplified response capture logic to improve reliability
+- Enhanced debug output to show actual command execution results
+- Improved session creation with better error handling
+- Extended wait time after sending messages for better stability
+- Fixed issues where messages weren't being sent properly
 
 ### Version 1.4.0
 - Added enhanced response detection with regex patterns

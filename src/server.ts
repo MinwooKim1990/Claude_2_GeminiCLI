@@ -19,7 +19,7 @@ const PERMISSION_TIMEOUT = 3000; // 3 seconds for permission responses
 // Create MCP server
 const server = new McpServer({
   name: "gemini-cli",
-  version: "1.4.0",
+  version: "1.4.1",
   description: "MCP server for interacting with Gemini CLI via tmux"
 });
 
@@ -89,40 +89,64 @@ function preprocessMessage(message: string, workingDir: string = process.cwd()):
 // Helper functions
 async function checkSession(): Promise<boolean> {
   try {
-    const { stdout } = await execAsync(`tmux has-session -t ${SESSION_NAME} 2>/dev/null`);
+    await execAsync(`tmux has-session -t ${SESSION_NAME} 2>&1`);
     return true;
-  } catch {
+  } catch (error) {
     return false;
   }
 }
 
 async function createSession(workingDir?: string): Promise<void> {
   const cwd = workingDir || process.cwd();
-  await execAsync(`tmux new-session -d -s ${SESSION_NAME} -c "${cwd}" 'gemini'`);
   
-  // Wait for Gemini to fully initialize (3 seconds to be safe)
-  await new Promise(resolve => setTimeout(resolve, 3000));
-  
-  // Clear any initial output by sending a newline
-  await execAsync(`tmux send-keys -t ${SESSION_NAME} Enter`);
-  await new Promise(resolve => setTimeout(resolve, 500));
+  try {
+    // Create session with gemini command
+    await execAsync(`tmux new-session -d -s ${SESSION_NAME} -c "${cwd}" 'gemini'`);
+    console.error(`[Gemini MCP] Created new session in ${cwd}`);
+    
+    // Wait for Gemini to fully initialize
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // Send an initial Enter to clear any startup messages
+    await execAsync(`tmux send-keys -t ${SESSION_NAME} Enter`);
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+  } catch (error) {
+    console.error(`[Gemini MCP] Failed to create session: ${error}`);
+    throw error;
+  }
 }
 
 async function sendMessage(message: string, debug: boolean = false): Promise<void> {
-  // Escape single quotes for shell command
-  const escapedMessage = message.replace(/'/g, "'\\''");
-  
-  // Send the message text without quotes - tmux will handle the text as-is
-  const sendCmd = `tmux send-keys -t ${SESSION_NAME} '${escapedMessage}'`;
-  const enterCmd = `tmux send-keys -t ${SESSION_NAME} Enter`;
-  
-  if (debug) {
-    trackCommand(sendCmd);
-    trackCommand(enterCmd);
+  try {
+    // Use -l flag for literal text - this handles all special characters properly
+    const sendCmd = `tmux send-keys -t ${SESSION_NAME} -l "${message.replace(/"/g, '\\"')}"`;
+    const enterCmd = `tmux send-keys -t ${SESSION_NAME} Enter`;
+    
+    if (debug) {
+      trackCommand(sendCmd);
+      trackCommand(enterCmd);
+      console.error(`[Gemini MCP Debug] Sending message: "${message}"`);
+    }
+    
+    // Execute and capture any errors
+    const { stdout: sendOut, stderr: sendErr } = await execAsync(sendCmd);
+    if (debug && sendErr) {
+      console.error(`[Gemini MCP Debug] Send command stderr: ${sendErr}`);
+    }
+    
+    const { stdout: enterOut, stderr: enterErr } = await execAsync(enterCmd);
+    if (debug && enterErr) {
+      console.error(`[Gemini MCP Debug] Enter command stderr: ${enterErr}`);
+    }
+    
+    // Give tmux time to process the keys
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+  } catch (error) {
+    console.error(`[Gemini MCP] Error in sendMessage: ${error}`);
+    throw error;
   }
-  
-  await execAsync(sendCmd);
-  await execAsync(enterCmd);
 }
 
 async function captureResponse(timeout: number = DEFAULT_TIMEOUT, debug: boolean = false): Promise<string> {
@@ -130,97 +154,66 @@ async function captureResponse(timeout: number = DEFAULT_TIMEOUT, debug: boolean
   let lastOutput = "";
   let stableCount = 0;
   let hasSeenProcessing = false;
-  let lastChangeTime = Date.now();
-  let hasSeenGeminiResponse = false;
+  
+  if (debug) {
+    console.error(`[Gemini MCP Debug] Starting response capture with ${timeout}ms timeout`);
+  }
   
   while (Date.now() - startTime < timeout) {
     try {
-      const captureCmd = `tmux capture-pane -t ${SESSION_NAME} -p`;
+      const captureCmd = `tmux capture-pane -t ${SESSION_NAME} -p -S -`;
       if (debug) trackCommand(captureCmd);
       
       const { stdout } = await execAsync(captureCmd);
-      if (debug && debugInfo.rawOutput.length < 50000) {
+      
+      // Store raw output for debug
+      if (debug) {
         debugInfo.rawOutput = stdout;
       }
       
-      // Enhanced processing detection using patterns
-      if (responsePatterns.processing.test(stdout) || 
-          responsePatterns.searchingStatus.test(stdout)) {
+      // Simple processing detection
+      if (stdout.includes("⠦") || stdout.includes("⠴") || stdout.includes("⠼") || 
+          stdout.includes("Translating") || stdout.includes("Searching") || 
+          stdout.includes("Processing") || stdout.includes("GoogleSearch")) {
         hasSeenProcessing = true;
-        lastChangeTime = Date.now();
-        console.error("[Gemini MCP] Processing detected, continuing to wait...");
-      }
-      
-      // Check for Gemini response start
-      if (responsePatterns.geminiStart.test(stdout)) {
-        hasSeenGeminiResponse = true;
-        console.error("[Gemini MCP] Gemini response started");
+        if (debug) console.error("[Gemini MCP Debug] Processing indicators detected");
       }
       
       // Check if output has changed
       if (stdout !== lastOutput) {
-        // Output changed, reset stability counter
         stableCount = 0;
         lastOutput = stdout;
-        lastChangeTime = Date.now();
-        
-        // Enhanced response completion detection
-        const lines = stdout.split('\n');
-        const nonEmptyLines = lines.filter(l => l.trim());
-        
-        // Check for various response patterns
-        let hasValidResponse = false;
-        for (const line of lines) {
-          if (responsePatterns.boxContent.test(line) ||
-              responsePatterns.listItem.test(line) ||
-              (line.trim() && !responsePatterns.processing.test(line) && 
-               !responsePatterns.geminiPrompt.test(line))) {
-            hasValidResponse = true;
-            break;
-          }
-        }
-        
-        if (hasValidResponse && hasSeenProcessing) {
-          console.error("[Gemini MCP] Valid response content detected");
-        }
+        if (debug) console.error("[Gemini MCP Debug] Output changed, resetting stability counter");
       } else {
-        // Output stable
         stableCount++;
         
-        // Enhanced stability requirements
-        const requiredStableCount = hasSeenProcessing ? 4 : 2;
-        const timeSinceLastChange = Date.now() - lastChangeTime;
-        
-        if (stableCount >= requiredStableCount && timeSinceLastChange > 3000) {
-          // No active processing indicators
-          if (!responsePatterns.processing.test(stdout) &&
-              !responsePatterns.searchingStatus.test(stdout)) {
-            
-            // Verify we have actual content
-            if (hasSeenGeminiResponse || hasSeenProcessing) {
-              console.error("[Gemini MCP] Response appears complete");
-              trackTiming("response_capture", startTime);
-              return stdout;
-            }
+        // Simple completion check - if output is stable and we've seen processing
+        if (stableCount >= 3 && hasSeenProcessing) {
+          // Make sure processing is done
+          if (!stdout.includes("⠦") && !stdout.includes("⠴") && !stdout.includes("⠼") &&
+              !stdout.includes("Translating") && !stdout.includes("Searching")) {
+            if (debug) console.error("[Gemini MCP Debug] Response appears complete");
+            return stdout;
           }
         }
       }
       
       // Check for permission UI
-      if (stdout.includes("Do you want to proceed?") || 
-          stdout.includes("Yes, allow once") ||
-          stdout.includes("Yes, allow always")) {
+      if (stdout.includes("Do you want to proceed?")) {
+        if (debug) console.error("[Gemini MCP Debug] Permission prompt detected");
         return stdout;
       }
       
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Check every second
+      await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (error) {
-      console.error("Error capturing response:", error);
+      console.error(`[Gemini MCP] Error capturing response: ${error}`);
+      if (debug) throw error;
     }
   }
   
-  console.error(`[Gemini MCP] Timeout reached after ${timeout}ms`);
-  trackTiming("response_capture_timeout", startTime);
+  if (debug) {
+    console.error(`[Gemini MCP Debug] Timeout after ${Date.now() - startTime}ms`);
+  }
   return lastOutput;
 }
 
@@ -246,110 +239,94 @@ function extractGeminiResponse(fullOutput: string, userMessage: string, debug: b
   const lines = fullOutput.split('\n');
   let messageIndex = -1;
   
-  // Find where the user message appears (look for exact match or partial)
+  if (debug) {
+    console.error(`[Gemini MCP Debug] Extracting response from ${lines.length} lines`);
+    console.error(`[Gemini MCP Debug] Looking for message: "${userMessage}"`);
+  }
+  
+  // Find where the user message appears
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(userMessage) || 
-        (userMessage.length > 20 && lines[i].includes(userMessage.substring(0, 20)))) {
+    if (lines[i].includes(userMessage)) {
       messageIndex = i;
+      if (debug) console.error(`[Gemini MCP Debug] Found user message at line ${i}`);
       break;
     }
   }
   
   if (messageIndex === -1) {
-    console.error("[Gemini MCP] User message not found in output, looking for response patterns...");
-    
-    // Look for Gemini response start pattern
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (responsePatterns.geminiStart.test(lines[i]) ||
-          responsePatterns.processing.test(lines[i]) ||
-          responsePatterns.searchingStatus.test(lines[i])) {
-        messageIndex = i;
-        console.error(`[Gemini MCP] Found response start at line ${i}`);
-        break;
-      }
-    }
-    
-    if (messageIndex === -1) {
-      // Last resort: look for content after the last "gemini>" prompt
-      for (let i = lines.length - 1; i >= 0; i--) {
-        if (responsePatterns.geminiPrompt.test(lines[i])) {
+    // Try partial match for long messages
+    if (userMessage.length > 20) {
+      const partial = userMessage.substring(0, 20);
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes(partial)) {
           messageIndex = i;
+          if (debug) console.error(`[Gemini MCP Debug] Found partial message at line ${i}`);
           break;
         }
       }
     }
   }
   
-  if (messageIndex === -1 && debug) {
-    console.error("[Gemini MCP] No reference point found, returning full output");
+  if (messageIndex === -1) {
+    // Look for any processing indicator as a starting point
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes('✦') || lines[i].includes('⠴') || lines[i].includes('⠼')) {
+        messageIndex = i;
+        if (debug) console.error(`[Gemini MCP Debug] Found processing indicator at line ${i}`);
+        break;
+      }
+    }
+  }
+  
+  if (messageIndex === -1) {
+    if (debug) console.error("[Gemini MCP Debug] No reference point found");
     return fullOutput.trim();
   }
   
-  // Extract lines after the reference point
+  // Extract response - simple approach
   const responseLines = [];
-  let foundResponse = false;
-  let emptyLineCount = 0;
-  let inCodeBlock = false;
-  let inBox = false;
+  let foundContent = false;
   
   for (let i = messageIndex + 1; i < lines.length; i++) {
     const line = lines[i];
     
-    // Track code blocks
-    if (responsePatterns.codeBlock.test(line)) {
-      inCodeBlock = !inCodeBlock;
-      foundResponse = true;
-    }
-    
-    // Track box content
-    if (responsePatterns.boxBorder.test(line)) {
-      inBox = !inBox;
-      foundResponse = true;
-    }
-    
-    // Skip status indicators only if we haven't found response yet
-    if (!foundResponse && (
-      responsePatterns.processing.test(line) ||
-      responsePatterns.searchingStatus.test(line) ||
-      responsePatterns.geminiStart.test(line) ||
-      (line.trim() === '' && !inCodeBlock && !inBox)
+    // Skip initial processing indicators
+    if (!foundContent && (
+      line.includes('⠦') || line.includes('⠴') || line.includes('⠼') ||
+      line.includes('✦') || line.includes('Translating') || 
+      line.includes('Searching') || line.includes('GoogleSearch') ||
+      line.trim() === ''
     )) {
       continue;
     }
     
-    // Once we find content, include everything until the next prompt
-    if (line.trim() !== '' || inCodeBlock || inBox) {
-      foundResponse = true;
-      emptyLineCount = 0;
-    } else if (foundResponse) {
-      emptyLineCount++;
-    }
-    
-    // Stop at the next prompt or shell mode indicator
-    if (!inCodeBlock && !inBox && (
-        responsePatterns.geminiPrompt.test(line) || 
-        line.includes('shell mode enabled') ||
-        line.trim() === '!' ||
-        responsePatterns.promptReturn.test(line))) {
+    // Stop at next prompt
+    if (line.includes('gemini>') || line.includes('shell mode enabled')) {
       break;
     }
     
-    // Stop if too many consecutive empty lines (unless in code block)
-    if (!inCodeBlock && !inBox && emptyLineCount > 3) {
-      break;
+    // We found actual content
+    if (line.trim() !== '') {
+      foundContent = true;
     }
     
-    // If we've found response content, include it
-    if (foundResponse) {
+    if (foundContent || line.trim() !== '') {
       responseLines.push(line);
     }
   }
   
-  const response = responseLines.join('\n').trim();
-  console.error(`[Gemini MCP] Extracted ${responseLines.length} lines of response`);
+  // Trim trailing empty lines
+  while (responseLines.length > 0 && responseLines[responseLines.length - 1].trim() === '') {
+    responseLines.pop();
+  }
   
-  if (debug && response.length === 0) {
-    console.error("[Gemini MCP] Empty response extracted, check raw output in debug info");
+  const response = responseLines.join('\n');
+  
+  if (debug) {
+    console.error(`[Gemini MCP Debug] Extracted ${responseLines.length} lines`);
+    if (response.length === 0) {
+      console.error("[Gemini MCP Debug] Empty response - check raw output");
+    }
   }
   
   return response;
@@ -444,8 +421,9 @@ Example: Ask Gemini to search for news, explain concepts, or analyze @package.js
       // Send the message
       await sendMessage(processedMessage, debug);
       
-      // Wait a bit for processing to start
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Wait longer for Gemini to process the message
+      console.error("[Gemini MCP] Waiting for Gemini to process message...");
+      await new Promise(resolve => setTimeout(resolve, 3000));
       
       // Capture initial response
       let response = await captureResponse(timeout, debug);
@@ -479,15 +457,24 @@ Example: Ask Gemini to search for news, explain concepts, or analyze @package.js
       
       if (debug) {
         // Return debug information along with response
+        const debugText = [
+          `Response:\n${responseText}`,
+          `\n--- Debug Information ---`,
+          `Total execution time: ${Date.now() - startTime}ms`,
+          `Session existed: ${sessionExists}`,
+          `Message sent: "${processedMessage}"`,
+          `Timeout used: ${timeout}ms`,
+          `\nCommands executed (${debugInfo.tmuxCommands.length}):`,
+          ...debugInfo.tmuxCommands.map((cmd, i) => `  ${i+1}. ${cmd}`),
+          `\nRaw output sample (last 500 chars):`,
+          debugInfo.rawOutput.slice(-500),
+          `\nExtracted response: ${geminiResponse.length} chars`
+        ].join('\n');
+        
         return {
           content: [{
             type: "text",
-            text: `Response:\n${responseText}\n\n--- Debug Information ---\n` +
-                  `Total execution time: ${Date.now() - startTime}ms\n` +
-                  `Timings: ${JSON.stringify(debugInfo.timings, null, 2)}\n` +
-                  `Commands executed: ${debugInfo.tmuxCommands.length}\n` +
-                  `Raw output length: ${debugInfo.rawOutput.length} chars\n` +
-                  `Session info: ${JSON.stringify(debugInfo.sessionInfo, null, 2)}`
+            text: debugText
           }]
         };
       } else {
