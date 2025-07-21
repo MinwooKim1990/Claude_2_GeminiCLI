@@ -8,7 +8,7 @@ import { spawn, execSync } from "child_process";
 // Create MCP server
 const server = new McpServer({
   name: "gemini-cli",
-  version: "1.5.4",
+  version: "1.5.5",
   description: "MCP server for interacting with Gemini CLI (one-shot mode)"
 });
 
@@ -115,46 +115,77 @@ async function sendOneShot(message: string): Promise<string> {
       } else if (code !== 0 && code !== null && !hasReceivedData) {
         reject(new Error(`Gemini process failed (code ${code}): ${error || 'No output'}`));
       } else {
-        // Clean the output - remove "Loaded cached credentials." and quota error messages
-        const lines = output.split('\n');
-        let startProcessing = false;
-        let actualResponse = [];
+        // Parse the complex output from Gemini CLI
+        console.error(`[Gemini MCP] Raw output first 500 chars: ${output.substring(0, 500)}`);
+        console.error(`[Gemini MCP] Raw output last 500 chars: ${output.substring(output.length - 500)}`);
         
-        // Find where the actual response starts (after error messages)
-        for (let i = lines.length - 1; i >= 0; i--) {
-          const line = lines[i];
-          if (line.includes('Loaded cached credentials.')) {
-            // Start collecting lines after this
-            startProcessing = true;
-            continue;
-          }
-          if (startProcessing) {
-            actualResponse.unshift(line);
+        let cleanedOutput = output;
+        
+        // Method 1: Find content after "Loaded cached credentials."
+        const credentialsIndex = output.lastIndexOf('Loaded cached credentials.');
+        if (credentialsIndex !== -1) {
+          const afterCredentials = output.substring(credentialsIndex + 'Loaded cached credentials.'.length).trim();
+          if (afterCredentials.length > 0) {
+            cleanedOutput = afterCredentials;
+            console.error(`[Gemini MCP] Found response after credentials: ${cleanedOutput.substring(0, 100)}...`);
           }
         }
         
-        // If we found a response after "Loaded cached credentials.", use it
-        let cleanedOutput = actualResponse.join('\n').trim();
-        
-        // If no response found after credentials message, try to extract from full output
-        if (!cleanedOutput) {
-          // Look for common response patterns
-          const responseStartIndex = output.lastIndexOf('The user sent the following message:');
-          if (responseStartIndex !== -1) {
-            cleanedOutput = output.substring(responseStartIndex).trim();
-          } else {
-            // Fallback: remove known error patterns
-            cleanedOutput = lines
-              .filter(line => !line.includes('Loaded cached credentials.'))
-              .filter(line => !line.includes('Quota exceeded'))
-              .filter(line => !line.includes('GaxiosError'))
-              .filter(line => !line.includes('at async'))
-              .join('\n').trim();
+        // Method 2: If output contains error but also has a response at the end
+        if (cleanedOutput.includes('Quota exceeded') || cleanedOutput.includes('quota limit')) {
+          // Look for the last substantial text block (not error messages)
+          const lines = cleanedOutput.split('\n');
+          let lastGoodContent = '';
+          let collectingContent = false;
+          
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i].trim();
+            
+            // Skip empty lines
+            if (!line) continue;
+            
+            // Skip error-related lines
+            if (line.includes('at async') || 
+                line.includes('at process') || 
+                line.includes('Error:') || 
+                line.includes('node_modules') ||
+                line.includes('{') || 
+                line.includes('}') ||
+                line.includes('[') || 
+                line.includes(']')) {
+              continue;
+            }
+            
+            // If we find "Loaded cached credentials", we've gone too far back
+            if (line.includes('Loaded cached credentials.')) {
+              break;
+            }
+            
+            // This looks like actual content
+            if (line.length > 10) {
+              lastGoodContent = line + (lastGoodContent ? '\n' + lastGoodContent : '');
+              collectingContent = true;
+            }
+          }
+          
+          if (lastGoodContent) {
+            cleanedOutput = lastGoodContent;
+            console.error(`[Gemini MCP] Extracted content from error output: ${cleanedOutput.substring(0, 100)}...`);
           }
         }
         
-        console.error(`[Gemini MCP] Response complete (${cleanedOutput.length} chars)`);
-        resolve(cleanedOutput || output); // Fallback to raw output if nothing found
+        // Remove any remaining "Loaded cached credentials." if it's the only content
+        if (cleanedOutput.trim() === 'Loaded cached credentials.') {
+          cleanedOutput = '';
+        }
+        
+        console.error(`[Gemini MCP] Final response length: ${cleanedOutput.length} chars`);
+        
+        if (!cleanedOutput || cleanedOutput.length < 5) {
+          console.error(`[Gemini MCP] Warning: Response seems too short or empty`);
+        }
+        
+        resolve(cleanedOutput);
       }
     });
     
@@ -276,7 +307,7 @@ server.registerTool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Gemini CLI MCP server v1.5.4 (one-shot mode) running");
+  console.error("Gemini CLI MCP server v1.5.5 (one-shot mode) running");
 }
 
 main().catch((error) => {
